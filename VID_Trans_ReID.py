@@ -64,9 +64,6 @@ def unpack_teacher_outputs(outputs):
     - (score, feat, a_vals)
     - (score, feat, a_vals, aux)
     - longer tuples/lists
-
-    Returns:
-        teacher_feat, teacher_aux
     """
     teacher_aux = {}
 
@@ -78,13 +75,11 @@ def unpack_teacher_outputs(outputs):
         if len(outputs) == 0:
             raise ValueError("Teacher returned an empty tuple/list.")
 
-        # Most ReID repos return feat at index 1
         if len(outputs) >= 2:
             teacher_feat = outputs[1]
         else:
             teacher_feat = outputs[0]
 
-        # If last object is a dict, treat it as aux
         if isinstance(outputs[-1], dict):
             teacher_aux = outputs[-1]
 
@@ -95,25 +90,23 @@ def unpack_teacher_outputs(outputs):
 
 def select_teacher_global(teacher_feat, teacher_aux, teacher_use_bn=False):
     """
-    Pick the best global teacher feature for distillation.
-    Priority:
-    - aux['global_bn'] if teacher_use_bn
-    - aux['global_raw']
-    - aux['global_bn']
-    - teacher_feat
-    """
-    teacher_global = None
+    For your base-paper teacher, distill from the teacher FINAL retrieval feature.
 
-    if isinstance(teacher_aux, dict):
+    Priority:
+    1. teacher_feat
+    2. aux['global_bn'] if teacher_use_bn
+    3. aux['global_raw']
+    4. aux['global_bn']
+    """
+    teacher_global = teacher_feat
+
+    if teacher_global is None and isinstance(teacher_aux, dict):
         if teacher_use_bn and 'global_bn' in teacher_aux:
             teacher_global = teacher_aux['global_bn']
         elif 'global_raw' in teacher_aux:
             teacher_global = teacher_aux['global_raw']
         elif 'global_bn' in teacher_aux:
             teacher_global = teacher_aux['global_bn']
-
-    if teacher_global is None:
-        teacher_global = teacher_feat
 
     if isinstance(teacher_global, (list, tuple)):
         teacher_global = teacher_global[0]
@@ -136,12 +129,12 @@ if __name__ == '__main__':
     parser.add_argument('--seq_len', default=4, type=int)
     parser.add_argument('--center_w', default=0.0, type=float)
     parser.add_argument('--attn_w', default=1.0, type=float)
-    parser.add_argument('--xcam_w', default=0.12, type=float)
+    parser.add_argument('--xcam_w', default=0.10, type=float)
     parser.add_argument('--xcam_temp', default=0.07, type=float)
     parser.add_argument('--xcam_same_cam_w', default=0.25, type=float)
     parser.add_argument('--xcam_blocks', default='8', type=str)
-    parser.add_argument('--fd_w', default=0.20, type=float, help='feature distillation weight')
-    parser.add_argument('--rd_w', default=0.10, type=float, help='relation distillation weight')
+    parser.add_argument('--fd_w', default=0.15, type=float, help='feature distillation weight')
+    parser.add_argument('--rd_w', default=0.05, type=float, help='relation distillation weight')
     parser.add_argument('--teacher_use_bn', action='store_true', help='distill teacher BN feature instead of raw global feature')
     args = parser.parse_args()
 
@@ -252,7 +245,15 @@ if __name__ == '__main__':
                 loss_id, center = loss_fun(score, feat, pid, seq_cam)
                 xcam_loss = xcam_criterion(aux['xcam_feats'], pid, seq_cam)
 
-                student_global = aux['global_raw']
+                # Distill on FINAL retrieval feature, not aux['global_raw']
+                student_global = feat
+
+                if isinstance(student_global, (list, tuple)):
+                    student_global = student_global[0]
+
+                if isinstance(teacher_global, (list, tuple)):
+                    teacher_global = teacher_global[0]
+
                 fd_loss = feat_distill(student_global, teacher_global)
                 rd_loss = rel_distill(student_global, teacher_global)
 
