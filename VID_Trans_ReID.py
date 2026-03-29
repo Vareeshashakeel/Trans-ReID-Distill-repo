@@ -43,17 +43,88 @@ def load_teacher_weights(model, path):
         state = state['model']
     if 'state_dict' in state:
         state = state['state_dict']
+
     clean = {}
     for k, v in state.items():
         clean[k.replace('module.', '')] = v
+
     missing, unexpected = model.load_state_dict(clean, strict=False)
     print('[INFO] Teacher weights loaded from:', path)
     print('[INFO] Teacher missing keys:', len(missing))
     print('[INFO] Teacher unexpected keys:', len(unexpected))
 
 
+def unpack_teacher_outputs(outputs):
+    """
+    Robustly handle different teacher forward return formats.
+
+    Supported:
+    - tensor
+    - (score, feat)
+    - (score, feat, a_vals)
+    - (score, feat, a_vals, aux)
+    - longer tuples/lists
+
+    Returns:
+        teacher_feat, teacher_aux
+    """
+    teacher_aux = {}
+
+    if torch.is_tensor(outputs):
+        teacher_feat = outputs
+        return teacher_feat, teacher_aux
+
+    if isinstance(outputs, (list, tuple)):
+        if len(outputs) == 0:
+            raise ValueError("Teacher returned an empty tuple/list.")
+
+        # Most ReID repos return feat at index 1
+        if len(outputs) >= 2:
+            teacher_feat = outputs[1]
+        else:
+            teacher_feat = outputs[0]
+
+        # If last object is a dict, treat it as aux
+        if isinstance(outputs[-1], dict):
+            teacher_aux = outputs[-1]
+
+        return teacher_feat, teacher_aux
+
+    raise TypeError(f"Unsupported teacher output type: {type(outputs)}")
+
+
+def select_teacher_global(teacher_feat, teacher_aux, teacher_use_bn=False):
+    """
+    Pick the best global teacher feature for distillation.
+    Priority:
+    - aux['global_bn'] if teacher_use_bn
+    - aux['global_raw']
+    - aux['global_bn']
+    - teacher_feat
+    """
+    teacher_global = None
+
+    if isinstance(teacher_aux, dict):
+        if teacher_use_bn and 'global_bn' in teacher_aux:
+            teacher_global = teacher_aux['global_bn']
+        elif 'global_raw' in teacher_aux:
+            teacher_global = teacher_aux['global_raw']
+        elif 'global_bn' in teacher_aux:
+            teacher_global = teacher_aux['global_bn']
+
+    if teacher_global is None:
+        teacher_global = teacher_feat
+
+    if isinstance(teacher_global, (list, tuple)):
+        teacher_global = teacher_global[0]
+
+    return teacher_global
+
+
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Camera-aware teacher -> camera-agnostic student distillation over best intermediate XCam model')
+    parser = argparse.ArgumentParser(
+        description='Camera-aware teacher -> camera-agnostic student distillation over best intermediate XCam model'
+    )
     parser.add_argument('--Dataset_name', required=True, type=str)
     parser.add_argument('--model_path', required=True, type=str, help='ViT/ImageNet pretrained weight path for student init')
     parser.add_argument('--teacher_path', required=True, type=str, help='trained camera-aware teacher checkpoint')
@@ -79,17 +150,35 @@ if __name__ == '__main__':
     xcam_blocks = parse_block_indices(args.xcam_blocks)
 
     train_loader, _, num_classes, camera_num, view_num, q_val_loader, g_val_loader = dataloader(
-        args.Dataset_name, batch_size=args.batch_size, num_workers=args.num_workers, seq_len=args.seq_len
+        args.Dataset_name,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        seq_len=args.seq_len
     )
 
-    student = VID_Trans(num_classes=num_classes, camera_num=camera_num, pretrainpath=args.model_path,
-                        xcam_block_indices=xcam_blocks, camera_aware=False)
-    teacher = VID_Trans(num_classes=num_classes, camera_num=camera_num, pretrainpath=args.model_path,
-                        xcam_block_indices=xcam_blocks, camera_aware=True)
+    student = VID_Trans(
+        num_classes=num_classes,
+        camera_num=camera_num,
+        pretrainpath=args.model_path,
+        xcam_block_indices=xcam_blocks,
+        camera_aware=False
+    )
+
+    teacher = VID_Trans(
+        num_classes=num_classes,
+        camera_num=camera_num,
+        pretrainpath=args.model_path,
+        xcam_block_indices=xcam_blocks,
+        camera_aware=True
+    )
+
     load_teacher_weights(teacher, args.teacher_path)
 
     loss_fun, center_criterion = make_loss(num_classes=num_classes)
-    xcam_criterion = CrossCameraSupConLoss(temperature=args.xcam_temp, same_cam_weight=args.xcam_same_cam_w)
+    xcam_criterion = CrossCameraSupConLoss(
+        temperature=args.xcam_temp,
+        same_cam_weight=args.xcam_same_cam_w
+    )
     feat_distill = FeatureDistillLoss()
     rel_distill = RelationDistillLoss()
 
@@ -97,6 +186,7 @@ if __name__ == '__main__':
     student = student.to(device)
     teacher = teacher.to(device)
     center_criterion = center_criterion.to(device)
+
     teacher.eval()
     for p in teacher.parameters():
         p.requires_grad_(False)
@@ -104,12 +194,18 @@ if __name__ == '__main__':
     optimizer_main = optimizer(student)
     lr_scheduler = scheduler(optimizer_main)
     scaler = amp.GradScaler(enabled=(device == 'cuda'))
+
     optimizer_center = None
     if args.center_w > 0:
         optimizer_center = torch.optim.SGD(center_criterion.parameters(), lr=0.5)
 
-    loss_meter = AverageMeter(); id_meter = AverageMeter(); xcam_meter = AverageMeter(); acc_meter = AverageMeter()
-    fd_meter = AverageMeter(); rd_meter = AverageMeter()
+    loss_meter = AverageMeter()
+    id_meter = AverageMeter()
+    xcam_meter = AverageMeter()
+    acc_meter = AverageMeter()
+    fd_meter = AverageMeter()
+    rd_meter = AverageMeter()
+
     ema = ExponentialMovingAverage(student.parameters(), decay=0.995) if ExponentialMovingAverage is not None else None
     best_rank1 = 0.0
 
@@ -120,8 +216,9 @@ if __name__ == '__main__':
 
     for epoch in range(1, args.epochs + 1):
         start_time = time.time()
-        for m in [loss_meter, id_meter, xcam_meter, acc_meter, fd_meter, rd_meter]:
-            m.reset()
+        for meter in [loss_meter, id_meter, xcam_meter, acc_meter, fd_meter, rd_meter]:
+            meter.reset()
+
         lr_scheduler.step(epoch)
         student.train()
         teacher.eval()
@@ -138,28 +235,47 @@ if __name__ == '__main__':
             labels2 = labels2.to(device)
 
             with torch.no_grad():
-                _, _, _, teacher_aux = teacher(img, pid, cam_label=seq_cam)
-                teacher_feat = teacher_aux['global_bn'] if args.teacher_use_bn else teacher_aux['global_raw']
+                teacher_outputs = teacher(img, pid, cam_label=seq_cam)
+                teacher_feat, teacher_aux = unpack_teacher_outputs(teacher_outputs)
+                teacher_global = select_teacher_global(
+                    teacher_feat=teacher_feat,
+                    teacher_aux=teacher_aux,
+                    teacher_use_bn=args.teacher_use_bn
+                )
 
             with amp.autocast(enabled=(device == 'cuda')):
                 score, feat, a_vals, aux = student(img, pid, cam_label=seq_cam)
+
                 attn_noise = a_vals * labels2
                 attn_loss = attn_noise.sum(1).mean()
+
                 loss_id, center = loss_fun(score, feat, pid, seq_cam)
                 xcam_loss = xcam_criterion(aux['xcam_feats'], pid, seq_cam)
-                student_feat = aux['global_raw']
-                fd_loss = feat_distill(student_feat, teacher_feat)
-                rd_loss = rel_distill(student_feat, teacher_feat)
-                loss = loss_id + args.center_w * center + args.attn_w * attn_loss + args.xcam_w * xcam_loss + args.fd_w * fd_loss + args.rd_w * rd_loss
+
+                student_global = aux['global_raw']
+                fd_loss = feat_distill(student_global, teacher_global)
+                rd_loss = rel_distill(student_global, teacher_global)
+
+                loss = (
+                    loss_id
+                    + args.center_w * center
+                    + args.attn_w * attn_loss
+                    + args.xcam_w * xcam_loss
+                    + args.fd_w * fd_loss
+                    + args.rd_w * rd_loss
+                )
 
             scaler.scale(loss).backward()
             scaler.step(optimizer_main)
+
             if optimizer_center is not None:
                 for param in center_criterion.parameters():
                     if param.grad is not None:
                         param.grad.data *= (1.0 / args.center_w)
                 scaler.step(optimizer_center)
+
             scaler.update()
+
             if ema is not None:
                 ema.update()
 
@@ -177,20 +293,35 @@ if __name__ == '__main__':
 
             if device == 'cuda':
                 torch.cuda.synchronize()
+
             if iteration % 50 == 0:
-                print('Epoch[{}] Iteration[{}/{}] Loss: {:.3f}, ID+Tri: {:.3f}, XCam: {:.3f}, FD: {:.3f}, RD: {:.3f}, Acc: {:.3f}, Base Lr: {:.2e}'.format(
-                    epoch, iteration, len(train_loader), loss_meter.avg, id_meter.avg, xcam_meter.avg,
-                    fd_meter.avg, rd_meter.avg, acc_meter.avg, lr_scheduler._get_lr(epoch)[0]))
+                print(
+                    'Epoch[{}] Iteration[{}/{}] Loss: {:.3f}, ID+Tri: {:.3f}, XCam: {:.3f}, FD: {:.3f}, RD: {:.3f}, Acc: {:.3f}, Base Lr: {:.2e}'.format(
+                        epoch, iteration, len(train_loader),
+                        loss_meter.avg, id_meter.avg, xcam_meter.avg,
+                        fd_meter.avg, rd_meter.avg, acc_meter.avg,
+                        lr_scheduler._get_lr(epoch)[0]
+                    )
+                )
 
         print('Epoch {} finished in {:.1f}s'.format(epoch, time.time() - start_time))
+
         if epoch % args.eval_every == 0:
             student.eval()
             rank1, mAP = test(student, q_val_loader, g_val_loader)
             print('CMC: %.4f, mAP : %.4f' % (rank1, mAP))
-            latest_path = os.path.join(args.output_dir, f'{args.Dataset_name}_xcam_teacher_distill_latest.pth')
+
+            latest_path = os.path.join(
+                args.output_dir,
+                f'{args.Dataset_name}_xcam_teacher_distill_latest.pth'
+            )
             torch.save(student.state_dict(), latest_path)
+
             if best_rank1 < rank1:
                 best_rank1 = rank1
-                best_path = os.path.join(args.output_dir, f'{args.Dataset_name}_xcam_teacher_distill_best.pth')
+                best_path = os.path.join(
+                    args.output_dir,
+                    f'{args.Dataset_name}_xcam_teacher_distill_best.pth'
+                )
                 torch.save(student.state_dict(), best_path)
                 print(f'[OK] Saved best checkpoint: {best_path}')
