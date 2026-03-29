@@ -56,14 +56,10 @@ def load_teacher_weights(model, path):
 
 def unpack_teacher_outputs(outputs):
     """
-    Robustly handle different teacher forward return formats.
+    Handle different teacher return formats.
 
-    Supported:
-    - tensor
-    - (score, feat)
-    - (score, feat, a_vals)
-    - (score, feat, a_vals, aux)
-    - longer tuples/lists
+    Returns:
+        teacher_feat, teacher_aux
     """
     teacher_aux = {}
 
@@ -90,17 +86,19 @@ def unpack_teacher_outputs(outputs):
 
 def select_teacher_global(teacher_feat, teacher_aux, teacher_use_bn=False):
     """
-    For your base-paper teacher, distill from the teacher FINAL retrieval feature.
+    Select a 768-dim teacher global feature.
 
     Priority:
-    1. teacher_feat
-    2. aux['global_bn'] if teacher_use_bn
-    3. aux['global_raw']
-    4. aux['global_bn']
+    1. aux['global_bn'] if requested and available
+    2. aux['global_raw'] if available
+    3. aux['global_bn'] if available
+    4. otherwise derive global chunk from teacher_feat:
+       - if teacher_feat dim is 768, use it directly
+       - if teacher_feat dim is multiple of 768 (e.g. 13056), take first 768 chunk
     """
-    teacher_global = teacher_feat
+    teacher_global = None
 
-    if teacher_global is None and isinstance(teacher_aux, dict):
+    if isinstance(teacher_aux, dict):
         if teacher_use_bn and 'global_bn' in teacher_aux:
             teacher_global = teacher_aux['global_bn']
         elif 'global_raw' in teacher_aux:
@@ -108,8 +106,20 @@ def select_teacher_global(teacher_feat, teacher_aux, teacher_use_bn=False):
         elif 'global_bn' in teacher_aux:
             teacher_global = teacher_aux['global_bn']
 
+    if teacher_global is None:
+        teacher_global = teacher_feat
+
     if isinstance(teacher_global, (list, tuple)):
         teacher_global = teacher_global[0]
+
+    # If teacher feature is concatenated retrieval embedding, extract first 768-dim chunk
+    if teacher_global.dim() == 2 and teacher_global.size(1) != 768:
+        if teacher_global.size(1) % 768 == 0:
+            teacher_global = teacher_global[:, :768]
+        else:
+            raise ValueError(
+                f"Teacher feature dim {teacher_global.size(1)} is not compatible with 768-dim student global feature."
+            )
 
     return teacher_global
 
@@ -245,9 +255,8 @@ if __name__ == '__main__':
                 loss_id, center = loss_fun(score, feat, pid, seq_cam)
                 xcam_loss = xcam_criterion(aux['xcam_feats'], pid, seq_cam)
 
-                # Distill on FINAL retrieval feature, not aux['global_raw']
-                student_global = feat
-
+                # Student global is 768-dim
+                student_global = aux['global_raw']
                 if isinstance(student_global, (list, tuple)):
                     student_global = student_global[0]
 
